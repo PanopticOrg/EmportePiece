@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="fr">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YOLO Annotation App</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useRef, useEffect } = React;
+
+        const API_URL = 'http://localhost:8001';
+
+        const getHandles = (box, scaleX, scaleY) => {
+            const x = box.x * scaleX;
+            const y = box.y * scaleY;
+            const w = box.width * scaleX;
+            const h = box.height * scaleY;
+
+            return [
+                { x, y, type: 'tl', scaledX: x, scaledY: y },
+                { x: box.x + box.width, y: box.y, type: 'tr', scaledX: x + w, scaledY: y },
+                { x: box.x, y: box.y + box.height, type: 'bl', scaledX: x, scaledY: y + h },
+                { x: box.x + box.width, y: box.y + box.height, type: 'br', scaledX: x + w, scaledY: y + h }
+            ];
+        };
+
+        const isNearHandle = (mouseX, mouseY, handle, threshold = 12) => {
+            return Math.abs(mouseX - handle.scaledX) < threshold && 
+                   Math.abs(mouseY - handle.scaledY) < threshold;
+        };
+
+        const isInsideBox = (mouseX, mouseY, box, scaleX, scaleY) => {
+            const x = box.x * scaleX;
+            const y = box.y * scaleY;
+            const w = box.width * scaleX;
+            const h = box.height * scaleY;
+            return mouseX >= x && mouseX <= x + w && mouseY >= y && mouseY <= y + h;
+        };
+
+        const drawBoxes = (ctx, boxes, scaleX, scaleY) => {
+            ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = "#00ff00";
+
+            boxes.forEach((box, boxIndex) => {
+                const x = box.x * scaleX;
+                const y = box.y * scaleY;
+                const w = box.width * scaleX;
+                const h = box.height * scaleY;
+
+                // Rectangle
+                ctx.strokeRect(x, y, w, h);
+
+                // Poignées
+                const handles = getHandles(box, scaleX, scaleY);
+                ctx.fillStyle = "#00ff00";
+                handles.forEach(({ scaledX, scaledY }) => {
+                    ctx.beginPath();
+                    ctx.arc(scaledX, scaledY, 6, 0, Math.PI * 2);
+                    ctx.fill();
+                });
+
+                // Label
+                ctx.font = "14px Arial";
+                const label = `${box.class} (${(box.confidence * 100).toFixed(1)}%)`;
+                const labelWidth = ctx.measureText(label).width + 10;
+
+                ctx.fillStyle = "#00ff00";
+                ctx.fillRect(x, y - 22, labelWidth + 24, 20);
+
+                ctx.fillStyle = "#000";
+                ctx.fillText(label, x + 5, y - 7);
+
+                // Bouton de suppression (croix rouge)
+                const deleteX = x + labelWidth + 8;
+                const deleteY = y - 22;
+                const deleteSize = 16;
+
+                // Fond du bouton de suppression
+                ctx.fillStyle = "#ef4444";
+                ctx.fillRect(deleteX, deleteY + 2, deleteSize, deleteSize);
+
+                // Croix blanche
+                ctx.strokeStyle = "#ffffff";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(deleteX + 4, deleteY + 6);
+                ctx.lineTo(deleteX + deleteSize - 4, deleteY + deleteSize - 2);
+                ctx.moveTo(deleteX + deleteSize - 4, deleteY + 6);
+                ctx.lineTo(deleteX + 4, deleteY + deleteSize - 2);
+                ctx.stroke();
+
+                // Stocker les coordonnées du bouton de suppression pour la détection de clic
+                box._deleteButton = {
+                    x: deleteX,
+                    y: deleteY + 2,
+                    width: deleteSize,
+                    height: deleteSize
+                };
+            });
+        };
+
+        const detectWithYolo = async (file) => {
+            const formData = new FormData();
+            formData.append('file', file);
+
+            const response = await fetch(`${API_URL}/api/detect`, {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!response.ok) {
+                throw new Error('Erreur lors de la détection YOLO');
+            }
+
+            return await response.json();
+        };
+
+        const saveAndExtractCrops = async (imageId, boxes) => {
+            const response = await fetch(`${API_URL}/api/extract`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    image_id: imageId,
+                    boxes: boxes.map(box => ({
+                        x: box.x,
+                        y: box.y,
+                        width: box.width,
+                        height: box.height,
+                        confidence: box.confidence,
+                        class_name: box.class
+                    }))
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error('Erreur lors de la sauvegarde des crops');
+            }
+
+            return await response.json();
+        };
+
+        function YoloAnnotationApp() {
+            const [images, setImages] = useState([]);
+            const [currentIndex, setCurrentIndex] = useState(0);
+            const [boxes, setBoxes] = useState([]);
+            const [dragInfo, setDragInfo] = useState(null);
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [error, setError] = useState(null);
+            const [scale, setScale] = useState({ x: 1, y: 1 });
+            const [cursor, setCursor] = useState('default');
+            const [processingStatus, setProcessingStatus] = useState('');
+
+            const canvasRef = useRef(null);
+            const imgRef = useRef(null);
+
+            // Dessiner les boxes quand elles changent ou que l'échelle change
+            useEffect(() => {
+                if (!canvasRef.current || !imgRef.current || !images[currentIndex]) return;
+
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+
+                drawBoxes(ctx, boxes, scale.x, scale.y);
+            }, [boxes, images, currentIndex, scale]);
+
+            // Gérer le chargement de l'image
+            const handleImageLoad = () => {
+                const img = imgRef.current;
+                const canvas = canvasRef.current;
+                if (!img || !canvas) return;
+
+                const rect = img.getBoundingClientRect();
+                const naturalWidth = img.naturalWidth;
+                const naturalHeight = img.naturalHeight;
+
+                canvas.width = rect.width;
+                canvas.height = rect.height;
+
+                const newScale = {
+                    x: rect.width / naturalWidth,
+                    y: rect.height / naturalHeight
+                };
+
+                setScale(newScale);
+
+                // Redessiner immédiatement avec la nouvelle échelle
+                const ctx = canvas.getContext('2d');
+                drawBoxes(ctx, boxes, newScale.x, newScale.y);
+            };
+
+            // Traiter l'image courante avec YOLO
+            const processCurrentImage = async () => {
+                const currentImage = images[currentIndex];
+                
+                // Si l'image a déjà été traitée, on ne fait rien
+                if (currentImage.processed) {
+                    setBoxes(currentImage.detectedBoxes || []);
+                    return;
+                }
+
+                setIsProcessing(true);
+                setProcessingStatus('Détection YOLO en cours...');
+                setError(null);
+
+                try {
+                    const detectionResult = await detectWithYolo(currentImage.file);
+                    
+                    // Mettre à jour l'image avec les résultats
+                    const updatedImages = [...images];
+                    updatedImages[currentIndex] = {
+                        ...currentImage,
+                        imageId: detectionResult.image_id,
+                        detectedBoxes: detectionResult.boxes,
+                        processed: true
+                    };
+                    
+                    setImages(updatedImages);
+                    setBoxes(detectionResult.boxes || []);
+                    setProcessingStatus('');
+                } catch (err) {
+                    console.error('Erreur lors de la détection:', err);
+                    setError('Erreur lors de la détection YOLO. Vérifiez que le serveur est démarré.');
+                    setProcessingStatus('');
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            // Charger l'image courante au changement d'index
+            useEffect(() => {
+                if (images.length > 0 && images[currentIndex]) {
+                    processCurrentImage();
+                }
+            }, [currentIndex, images.length]);
+
+            const handleFileUpload = async (e) => {
+                const files = Array.from(e.target.files);
+                const imageFiles = files.filter(f => f.type.startsWith('image/'));
+
+                if (imageFiles.length === 0) {
+                    setError('Aucune image valide sélectionnée');
+                    return;
+                }
+
+                setError(null);
+
+                // Créer les objets image sans les traiter
+                const loadedImages = imageFiles.map(file => ({
+                    data: URL.createObjectURL(file),
+                    name: file.name,
+                    file: file,
+                    imageId: null,
+                    detectedBoxes: [],
+                    processed: false
+                }));
+
+                setImages(loadedImages);
+                setCurrentIndex(0);
+                setBoxes([]);
+                // Le useEffect se chargera de traiter la première image
+            };
+
+            const saveCurrentCrops = async () => {
+                const currentImage = images[currentIndex];
+                
+                if (!currentImage.processed || boxes.length === 0) {
+                    return true;
+                }
+
+                setIsProcessing(true);
+                setProcessingStatus('Sauvegarde des crops...');
+                
+                try {
+                    const result = await saveAndExtractCrops(
+                        currentImage.imageId,
+                        boxes
+                    );
+                    console.log(`✓ ${result.count} crops sauvegardés pour ${currentImage.name}`);
+                    setIsProcessing(false);
+                    setProcessingStatus('');
+                    return true;
+                } catch (err) {
+                    console.error('Erreur lors de la sauvegarde:', err);
+                    setError('Erreur lors de la sauvegarde des crops');
+                    setIsProcessing(false);
+                    setProcessingStatus('');
+                    return false;
+                }
+            };
+
+            const goToNextImage = async () => {
+                if (currentIndex >= images.length - 1) return;
+
+                // Sauvegarder les crops de l'image actuelle
+                const saved = await saveCurrentCrops();
+                if (!saved) return;
+
+                // Passer à l'image suivante
+                setCurrentIndex(currentIndex + 1);
+                // Le useEffect se chargera de traiter la nouvelle image
+            };
+
+            const finishAndSave = async () => {
+                // Sauvegarder les crops de la dernière image
+                const saved = await saveCurrentCrops();
+                if (saved && boxes.length > 0) {
+                    alert(`Traitement terminé ! Tous les crops ont été sauvegardés dans le dossier output/`);
+                } else if (saved) {
+                    alert(`Traitement terminé !`);
+                }
+            };
+
+            const goToPrevImage = () => {
+                if (currentIndex > 0) {
+                    setCurrentIndex(currentIndex - 1);
+                    // Le useEffect se chargera de charger les boxes de l'image précédente
+                }
+            };
+
+            const handleMouseDown = (e) => {
+                const canvas = canvasRef.current;
+                const rect = canvas.getBoundingClientRect();
+                const mouseX = e.clientX - rect.left;
+                const mouseY = e.clientY - rect.top;
+
+                // Vérifier si on clique sur un bouton de suppression
+                for (let i = 0; i < boxes.length; i++) {
+                    const box = boxes[i];
+                    if (box._deleteButton) {
+                        const btn = box._deleteButton;
+                        if (mouseX >= btn.x && mouseX <= btn.x + btn.width &&
+                            mouseY >= btn.y && mouseY <= btn.y + btn.height) {
+                            // Supprimer la box
+                            const newBoxes = boxes.filter((_, idx) => idx !== i);
+                            setBoxes(newBoxes);
+                            return;
+                        }
+                    }
+                }
+
+                // Vérifier si on clique sur une poignée
+                for (let i = 0; i < boxes.length; i++) {
+                    const box = boxes[i];
+                    const handles = getHandles(box, scale.x, scale.y);
+
+                    for (let handle of handles) {
+                        if (isNearHandle(mouseX, mouseY, handle)) {
+                            setDragInfo({ 
+                                boxIndex: i, 
+                                handleType: handle.type, 
+                                startX: mouseX / scale.x, 
+                                startY: mouseY / scale.y 
+                            });
+                            return;
+                        }
+                    }
+
+                    if (isInsideBox(mouseX, mouseY, box, scale.x, scale.y)) {
+                        setDragInfo({ 
+                            boxIndex: i, 
+                            handleType: 'move', 
+                            startX: mouseX / scale.x, 
+                            startY: mouseY / scale.y, 
+                            originalBox: { ...box } 
+                        });
+                        return;
+                    }
+                }
+            };
+
+            const handleMouseMove = (e) => {
+                const canvas = canvasRef.current;
+                const rect = canvas.getBoundingClientRect();
+                const mouseX = e.clientX - rect.left;
+                const mouseY = e.clientY - rect.top;
+
+                // Gestion du curseur
+                if (!dragInfo) {
+                    let newCursor = 'default';
+                    
+                    // Vérifier si la souris est sur un bouton de suppression
+                    for (let box of boxes) {
+                        if (box._deleteButton) {
+                            const btn = box._deleteButton;
+                            if (mouseX >= btn.x && mouseX <= btn.x + btn.width &&
+                                mouseY >= btn.y && mouseY <= btn.y + btn.height) {
+                                newCursor = 'pointer';
+                                setCursor(newCursor);
+                                return;
+                            }
+                        }
+                    }
+                    
+                    for (let box of boxes) {
+                        const handles = getHandles(box, scale.x, scale.y);
+                        
+                        for (let handle of handles) {
+                            if (isNearHandle(mouseX, mouseY, handle)) {
+                                if (handle.type === 'tl' || handle.type === 'br') {
+                                    newCursor = 'nwse-resize';
+                                } else {
+                                    newCursor = 'nesw-resize';
+                                }
+                                setCursor(newCursor);
+                                return;
+                            }
+                        }
+
+                        if (isInsideBox(mouseX, mouseY, box, scale.x, scale.y)) {
+                            newCursor = 'move';
+                            setCursor(newCursor);
+                            return;
+                        }
+                    }
+                    
+                    setCursor('crosshair');
+                    return;
+                }
+
+                // Gestion du drag
+                const x = mouseX / scale.x;
+                const y = mouseY / scale.y;
+
+                const newBoxes = [...boxes];
+                const box = newBoxes[dragInfo.boxIndex];
+                const img = imgRef.current;
+                const maxWidth = img.naturalWidth;
+                const maxHeight = img.naturalHeight;
+
+                if (dragInfo.handleType === 'move') {
+                    const dx = x - dragInfo.startX;
+                    const dy = y - dragInfo.startY;
+                    box.x = Math.max(0, Math.min(maxWidth - box.width, dragInfo.originalBox.x + dx));
+                    box.y = Math.max(0, Math.min(maxHeight - box.height, dragInfo.originalBox.y + dy));
+                } else {
+                    if (dragInfo.handleType === 'tl') {
+                        const newX = Math.max(0, Math.min(x, box.x + box.width - 10));
+                        const newY = Math.max(0, Math.min(y, box.y + box.height - 10));
+                        box.width += box.x - newX;
+                        box.height += box.y - newY;
+                        box.x = newX;
+                        box.y = newY;
+                    } else if (dragInfo.handleType === 'tr') {
+                        box.width = Math.max(10, Math.min(x - box.x, maxWidth - box.x));
+                        const newY = Math.max(0, Math.min(y, box.y + box.height - 10));
+                        box.height += box.y - newY;
+                        box.y = newY;
+                    } else if (dragInfo.handleType === 'bl') {
+                        const newX = Math.max(0, Math.min(x, box.x + box.width - 10));
+                        box.width += box.x - newX;
+                        box.x = newX;
+                        box.height = Math.max(10, Math.min(y - box.y, maxHeight - box.y));
+                    } else if (dragInfo.handleType === 'br') {
+                        box.width = Math.max(10, Math.min(x - box.x, maxWidth - box.x));
+                        box.height = Math.max(10, Math.min(y - box.y, maxHeight - box.y));
+                    }
+                }
+
+                setBoxes(newBoxes);
+            };
+
+            const handleMouseUp = () => {
+                setDragInfo(null);
+            };
+
+            return (
+                <div className="min-h-screen bg-gray-900 text-white p-8">
+                    <div className="max-w-7xl mx-auto">
+                        <h1 className="text-4xl font-bold mb-8 flex items-center gap-3">
+                            Extraction d'images
+                        </h1>
+
+                        {error && (
+                            <div className="mb-6 bg-red-900 border border-red-600 rounded-lg p-4 flex items-start gap-3">
+                                <svg className="w-5 h-5 flex-shrink-0 mt-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                </svg>
+                                <div>
+                                    <div className="font-semibold">Erreur</div>
+                                    <div className="text-sm text-red-200">{error}</div>
+                                </div>
+                            </div>
+                        )}
+
+                        {processingStatus && (
+                            <div className="mb-6 bg-blue-900 border border-blue-600 rounded-lg p-4 flex items-start gap-3">
+                                <svg className="w-5 h-5 flex-shrink-0 mt-1 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                </svg>
+                                <div>
+                                    <div className="font-semibold">{processingStatus}</div>
+                                </div>
+                            </div>
+                        )}
+
+                        {images.length === 0 && (
+                            <div className="border-4 border-dashed border-gray-600 rounded-lg p-16 text-center">
+                                <svg className="w-16 h-16 mx-auto mb-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                                </svg>
+                                <label className="cursor-pointer">
+                                    <span className="text-xl text-gray-400">
+                                        Cliquez pour uploader des images ou glissez-déposez
+                                    </span>
+                                    <input
+                                        type="file"
+                                        multiple
+                                        accept="image/*"
+                                        onChange={handleFileUpload}
+                                        className="hidden"
+                                        disabled={isProcessing}
+                                    />
+                                </label>
+                                <p className="text-sm text-gray-500 mt-4">
+                                    Les images seront traitées une par une lors de la navigation
+                                </p>
+                            </div>
+                        )}
+
+                        {images.length > 0 && (
+                            <div className="space-y-6">
+                                <div className="flex justify-between items-center">
+                                    <div className="text-xl">
+                                        Image {currentIndex + 1} / {images.length}
+                                        <span className="text-gray-400 ml-3">{images[currentIndex].name}</span>
+                                        {images[currentIndex].processed && (
+                                            <span className="ml-3 text-sm px-2 py-1 bg-green-900 text-green-300 rounded">
+                                                ✓ Traitée
+                                            </span>
+                                        )}
+                                    </div>
+                                    <div className="flex gap-3">
+                                        <label className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg flex items-center gap-2 cursor-pointer">
+                                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                                            </svg>
+                                            Charger d'autres images
+                                            <input
+                                                type="file"
+                                                multiple
+                                                accept="image/*"
+                                                onChange={handleFileUpload}
+                                                className="hidden"
+                                                disabled={isProcessing}
+                                            />
+                                        </label>
+                                    </div>
+                                </div>
+
+                                <div className="relative inline-block bg-black rounded-lg overflow-hidden">
+                                    <img
+                                        ref={imgRef}
+                                        src={images[currentIndex].data}
+                                        alt="Current"
+                                        className="max-w-full max-h-screen h-auto"
+                                        onLoad={handleImageLoad}
+                                    />
+
+                                    <canvas
+                                        ref={canvasRef}
+                                        onMouseDown={handleMouseDown}
+                                        onMouseMove={handleMouseMove}
+                                        onMouseUp={handleMouseUp}
+                                        onMouseLeave={handleMouseUp}
+                                        className="absolute top-0 left-0"
+                                        style={{ cursor }}
+                                    />
+                                    {isProcessing && (
+                                        <div className="absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center">
+                                            <div className="text-2xl flex items-center gap-3">
+                                                <svg className="w-8 h-8 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                                </svg>
+                                                {processingStatus || 'Traitement en cours...'}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="flex justify-between items-center">
+                                    <button
+                                        onClick={goToPrevImage}
+                                        disabled={currentIndex === 0 || isProcessing}
+                                        className="px-6 py-3 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed rounded-lg flex items-center gap-2"
+                                    >
+                                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                                        </svg>
+                                        Précédent
+                                    </button>
+
+                                    <div className="text-gray-400">
+                                        {boxes.length} bounding box{boxes.length > 1 ? 'es' : ''} détectée{boxes.length > 1 ? 's' : ''}
+                                    </div>
+
+                                    {currentIndex < images.length - 1 ? (
+                                        <button
+                                            onClick={goToNextImage}
+                                            disabled={isProcessing}
+                                            className="px-6 py-3 bg-green-600 hover:bg-green-700 disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed rounded-lg flex items-center gap-2"
+                                        >
+                                            Valider et Suivant
+                                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                                            </svg>
+                                        </button>
+                                    ) : (
+                                        <button
+                                            onClick={finishAndSave}
+                                            disabled={isProcessing}
+                                            className="px-6 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed rounded-lg flex items-center gap-2"
+                                        >
+                                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                            </svg>
+                                            Terminer et sauvegarder
+                                        </button>
+                                    )}
+                                </div>
+
+                                <div className="bg-gray-800 rounded-lg p-6">
+                                    <h2 className="text-2xl font-bold mb-4">Bounding Boxes détectées</h2>
+                                    {boxes.length === 0 ? (
+                                        <p className="text-gray-400">Aucune bounding box détectée pour cette image</p>
+                                    ) : (
+                                        <div className="space-y-2">
+                                            {boxes.map((box, idx) => (
+                                                <div key={idx} className="bg-gray-700 p-3 rounded flex justify-between items-center group">
+                                                    <div>
+                                                        <span className="font-semibold">{box.class}</span>
+                                                        <span className="text-gray-400 ml-3">
+                                                            Confiance: {(box.confidence * 100).toFixed(1)}%
+                                                        </span>
+                                                    </div>
+                                                    <div className="flex items-center gap-3">
+                                                        <div className="text-sm text-gray-400">
+                                                            x: {Math.round(box.x)}, y: {Math.round(box.y)},
+                                                            w: {Math.round(box.width)}, h: {Math.round(box.height)}
+                                                        </div>
+                                                        <button
+                                                            onClick={() => setBoxes(boxes.filter((_, i) => i !== idx))}
+                                                            className="opacity-0 group-hover:opacity-100 transition-opacity p-1 bg-red-600 hover:bg-red-700 rounded"
+                                                            title="Supprimer cette box"
+                                                        >
+                                                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                                            </svg>
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="bg-gray-800 rounded-lg p-4">
+                                    <div className="text-sm text-gray-400">
+                                        Les crops sont automatiquement sauvegardés dans le dossier output/ lors du passage à l'image suivante
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<YoloAnnotationApp />, document.getElementById('root'));
+    </script>
+</body>
+
+</html>
